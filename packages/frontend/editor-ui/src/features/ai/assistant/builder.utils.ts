@@ -5,10 +5,7 @@ import {
 } from '@/features/ai/assistant/assistant.types';
 import { useAIAssistantHelpers } from '@/features/ai/assistant/composables/useAIAssistantHelpers';
 import { usePostHog } from '@/app/stores/posthog.store';
-import {
-	AI_BUILDER_MULTI_AGENT_EXPERIMENT,
-	AI_BUILDER_TEMPLATE_EXAMPLES_EXPERIMENT,
-} from '@/app/constants/experiments';
+import { AI_BUILDER_TEMPLATE_EXAMPLES_EXPERIMENT } from '@/app/constants/experiments';
 import type { IRunExecutionData } from 'n8n-workflow';
 import type { IWorkflowDb } from '@/Interface';
 import { getWorkflowVersionsByIds } from '@n8n/rest-api-client/api/workflowHistory';
@@ -22,7 +19,7 @@ export function generateMessageId(): string {
 	return `${Date.now()}-${generateShortId()}`;
 }
 
-export function createBuilderPayload(
+export async function createBuilderPayload(
 	text: string,
 	id: string,
 	options: {
@@ -30,15 +27,21 @@ export function createBuilderPayload(
 		executionData?: IRunExecutionData['resultData'];
 		workflow?: IWorkflowDb;
 		nodesForSchema?: string[];
+		allowSendingParameterValues?: boolean;
 	} = {},
-): ChatRequest.UserChatMessage {
+): Promise<ChatRequest.UserChatMessage> {
 	const assistantHelpers = useAIAssistantHelpers();
 	const posthogStore = usePostHog();
 	const workflowContext: ChatRequest.WorkflowContext = {};
 
+	// When privacy is OFF (allowSendingParameterValues=false), exclude parameter values from workflow
+	const shouldExcludeParameterValues = options.allowSendingParameterValues === false;
+
 	if (options.workflow) {
 		workflowContext.currentWorkflow = {
-			...assistantHelpers.simplifyWorkflowForAssistant(options.workflow),
+			...(await assistantHelpers.simplifyWorkflowForAssistant(options.workflow, {
+				excludeParameterValues: shouldExcludeParameterValues,
+			})),
 			id: options.workflow.id,
 		};
 	}
@@ -46,22 +49,24 @@ export function createBuilderPayload(
 	if (options.executionData) {
 		workflowContext.executionData = assistantHelpers.simplifyResultData(options.executionData, {
 			compact: true,
+			removeParameterValues: shouldExcludeParameterValues,
 		});
 
-		if (options.workflow) {
+		if (options.workflow && !shouldExcludeParameterValues) {
 			// Extract and include expression values with their resolved values
 			// Pass execution data to only extract from nodes that have executed
-			workflowContext.expressionValues = assistantHelpers.extractExpressionsFromWorkflow(
+			workflowContext.expressionValues = await assistantHelpers.extractExpressionsFromWorkflow(
 				options.workflow,
 				options.executionData,
 			);
 		}
 	}
 
+	// Schema is always sent - include values only when privacy is ON (allowSendingParameterValues=true)
 	if (options.nodesForSchema?.length) {
 		workflowContext.executionSchema = assistantHelpers.getNodesSchemas(
 			options.nodesForSchema,
-			true,
+			shouldExcludeParameterValues, // excludeValues: true when privacy OFF, false when privacy ON
 		);
 	}
 
@@ -70,9 +75,6 @@ export function createBuilderPayload(
 		templateExamples:
 			posthogStore.getVariant(AI_BUILDER_TEMPLATE_EXAMPLES_EXPERIMENT.name) ===
 			AI_BUILDER_TEMPLATE_EXAMPLES_EXPERIMENT.variant,
-		multiAgent:
-			posthogStore.getVariant(AI_BUILDER_MULTI_AGENT_EXPERIMENT.name) ===
-			AI_BUILDER_MULTI_AGENT_EXPERIMENT.variant,
 	};
 
 	return {

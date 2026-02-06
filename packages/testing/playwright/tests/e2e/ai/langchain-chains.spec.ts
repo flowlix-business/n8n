@@ -6,7 +6,6 @@ import {
 	MANUAL_CHAT_TRIGGER_NODE_NAME,
 } from '../../../config/constants';
 import { test, expect } from '../../../fixtures/base';
-import { capabilities } from '../../../fixtures/capabilities';
 import type { n8nPage } from '../../../pages/n8nPage';
 
 // Helper functions for common operations
@@ -39,7 +38,7 @@ async function executeChatAndWaitForResponse(n8n: n8nPage, message: string) {
 	await waitForWorkflowSuccess(n8n);
 }
 
-test.use({ addContainerCapability: capabilities.proxy });
+test.use({ capability: 'proxy' });
 test.describe('Langchain Integration @capability:proxy', () => {
 	test.beforeEach(async ({ n8n, proxyServer }) => {
 		await proxyServer.clearAllExpectations();
@@ -83,7 +82,10 @@ test.describe('Langchain Integration @capability:proxy', () => {
 		});
 
 		test('should not auto-add nodes if ChatTrigger is already present', async ({ n8n }) => {
-			await n8n.canvas.addNode(MANUAL_CHAT_TRIGGER_NODE_NAME, { closeNDV: true });
+			await n8n.canvas.addNode(MANUAL_CHAT_TRIGGER_NODE_NAME, {
+				closeNDV: true,
+				trigger: 'On new Chat event',
+			});
 
 			await n8n.canvas.addNode(AGENT_NODE_NAME, { closeNDV: true });
 
