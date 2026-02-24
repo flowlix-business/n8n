@@ -13,6 +13,7 @@ import type {
 } from '../types/planning';
 import type {
 	AgentMessageChunk,
+	MessagesCompactedChunk,
 	PlanChunk,
 	QuestionsChunk,
 	ToolProgressChunk,
@@ -66,6 +67,7 @@ const SKIPPED_NODES = [
 	'auto_compact_messages',
 	'builder_subgraph',
 	'discovery_subgraph',
+	'assistant_subgraph',
 ];
 
 /**
@@ -146,11 +148,30 @@ function extractMessageContent(messages: MessageContent[]): string | null {
  * Remove context tags from message content that are used for AI context
  * but shouldn't be displayed to users.
  *
- * This removes the entire context block from <current_workflow_json> through
- * </current_execution_nodes_schemas>
+ * Handles multiple formats:
+ * 1. Old multi-agent format: <current_workflow_json>...</current_execution_nodes_schemas>
+ * 2. Code builder format with <user_request> XML tag
+ * 3. Fallback: strips individual context tags
  */
 export function cleanContextTags(text: string): string {
-	return text.replace(/\n*<current_workflow_json>[\s\S]*?<\/current_execution_nodes_schemas>/, '');
+	// Handle old multi-agent format
+	let cleaned = text.replace(
+		/\n*<current_workflow_json>[\s\S]*?<\/current_execution_nodes_schemas>/,
+		'',
+	);
+
+	// Handle code builder format - extract content from <user_request> tag
+	const userRequestMatch = cleaned.match(/<user_request>\n?([\s\S]*?)\n?<\/user_request>/);
+	if (userRequestMatch) {
+		return userRequestMatch[1].trim();
+	}
+
+	// Fallback: strip individual tags if no user request marker found
+	cleaned = cleaned.replace(/<conversation_summary>[\s\S]*?<\/conversation_summary>\s*/g, '');
+	cleaned = cleaned.replace(/<previous_requests>[\s\S]*?<\/previous_requests>\s*/g, '');
+	cleaned = cleaned.replace(/<workflow_file[^>]*>[\s\S]*?<\/workflow_file>\s*/g, '');
+
+	return cleaned.trim();
 }
 
 // ============================================================================
@@ -233,6 +254,19 @@ function processOperationsUpdate(update: unknown): StreamOutput | null {
 	return { messages: [workflowUpdateChunk] };
 }
 
+/** Handle create_workflow_name node update - emits name as workflow update */
+function processWorkflowNameUpdate(update: unknown): StreamOutput | null {
+	const typed = update as { workflowJSON?: { name?: string } } | undefined;
+	if (!typed?.workflowJSON?.name) return null;
+
+	const workflowUpdateChunk: WorkflowUpdateChunk = {
+		role: 'assistant',
+		type: 'workflow-updated',
+		codeSnippet: JSON.stringify(typed.workflowJSON, null, 2),
+	};
+	return { messages: [workflowUpdateChunk] };
+}
+
 /** Handle agent node message update */
 function processAgentNodeUpdate(nodeName: string, update: unknown): StreamOutput | null {
 	if (!shouldEmitFromNode(nodeName)) return null;
@@ -252,12 +286,20 @@ function processAgentNodeUpdate(nodeName: string, update: unknown): StreamOutput
 	return { messages: [messageChunk] };
 }
 
-/** Handle custom tool progress chunk */
-function processToolChunk(chunk: unknown): StreamOutput | null {
-	const typed = chunk as ToolProgressChunk;
-	if (typed?.type !== 'tool') return null;
+/** Handle custom event chunks (tool progress + assistant messages) */
+function processCustomChunk(chunk: unknown): StreamOutput | null {
+	if (!chunk || typeof chunk !== 'object') return null;
+	const typed = chunk as { type?: string };
 
-	return { messages: [typed] };
+	if (typed.type === 'tool') {
+		return { messages: [typed as ToolProgressChunk] };
+	}
+
+	if (typed.type === 'message' && 'role' in typed && 'text' in typed) {
+		return { messages: [typed as AgentMessageChunk] };
+	}
+
+	return null;
 }
 
 // ============================================================================
@@ -268,7 +310,12 @@ function processToolChunk(chunk: unknown): StreamOutput | null {
 function processUpdatesChunk(nodeUpdate: Record<string, unknown>): StreamOutput | null {
 	if (!nodeUpdate || typeof nodeUpdate !== 'object') return null;
 
-	if (nodeUpdate.delete_messages || nodeUpdate.compact_messages) {
+	if (nodeUpdate.compact_messages) {
+		const compactedChunk: MessagesCompactedChunk = { type: 'messages-compacted' };
+		return { messages: [compactedChunk] };
+	}
+
+	if (nodeUpdate.delete_messages) {
 		return null;
 	}
 
@@ -281,6 +328,12 @@ function processUpdatesChunk(nodeUpdate: Record<string, unknown>): StreamOutput 
 	// Process operations emits workflow updates
 	if (nodeUpdate.process_operations) {
 		return processOperationsUpdate(nodeUpdate.process_operations);
+	}
+
+	// Workflow name update - emit so frontend receives the generated name
+	// before any potential interrupt (e.g., plan mode approval)
+	if (nodeUpdate.create_workflow_name) {
+		return processWorkflowNameUpdate(nodeUpdate.create_workflow_name);
 	}
 
 	// Generic agent node handling
@@ -301,7 +354,7 @@ export function processStreamChunk(streamMode: string, chunk: unknown): StreamOu
 	}
 
 	if (streamMode === 'custom') {
-		return processToolChunk(chunk);
+		return processCustomChunk(chunk);
 	}
 
 	return null;
@@ -600,18 +653,21 @@ export function formatMessages(
 		if (msg instanceof HumanMessage) {
 			formattedMessages.push(formatHumanMessage(msg));
 		} else if (msg instanceof AIMessage) {
+			// Check for HITL messages (questions/plan) from persistence
 			const hitlMessage = tryFormatHitlMessage(msg);
 			if (hitlMessage) {
 				formattedMessages.push(hitlMessage);
 				continue;
 			}
 
-			// Add AI message content
-			formattedMessages.push(...processAIMessageContent(msg));
-
-			// Add tool calls if present
+			// If the message has tool_calls, only process the tool calls.
+			// The content in tool-calling messages is intermediate LLM "thinking" text
+			// that shouldn't be shown to the user.
 			if (msg.tool_calls?.length) {
 				formattedMessages.push(...processToolCalls(msg.tool_calls, builderTools));
+			} else {
+				// No tool calls - this is a final response, include the content
+				formattedMessages.push(...processAIMessageContent(msg));
 			}
 		} else if (msg instanceof ToolMessage) {
 			processToolMessage(msg, formattedMessages);
